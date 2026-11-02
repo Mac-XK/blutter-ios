@@ -1,0 +1,759 @@
+diff --git a/blutter.py b/blutter.py
+index dc12556..90521f1 100644
+--- a/blutter.py
++++ b/blutter.py
+@@ -130,6 +130,25 @@ def find_compat_macro(dart_version: str, no_analysis: bool):
+         if mm.find(b'AsTruncatedInt64Value()') == -1:
+             macros.append('-DUNIFORM_INTEGER_ACCESS=1')
+     
++    # Dart >= 3.13: constants_arm64.h no longer defines HEAP_BITS (renamed to PP)
++    with open(os.path.join(vm_path, 'constants_arm64.h'), 'rb') as f:
++        if b'HEAP_BITS' not in f.read():
++            macros.append('-DNO_HEAP_BITS=1')
++
++    # Dart >= 3.13: ObjectStore lost OBJECT_STORE_STUB_CODE_LIST (stubs moved to StubCode)
++    with open(os.path.join(vm_path, 'object_store.h'), 'rb') as f:
++        if b'OBJECT_STORE_STUB_CODE_LIST' not in f.read():
++            macros.append('-DNO_OBJECT_STORE_STUB_LIST=1')
++
++    # Dart >= 3.13: UntaggedClosure lost the context field
++    off_file = os.path.join(vm_path, 'compiler', 'runtime_offsets_extracted.h')
++    if os.path.exists(off_file):
++        with open(off_file, 'rb') as f:
++            if b'AOT_Closure_context_offset' not in f.read():
++                macros.append('-DNO_AOT_CLOSURE_OFFSETS=1')
++    else:
++        macros.append('-DNO_AOT_CLOSURE_OFFSETS=1')
++
+     if no_analysis:
+         macros.append('-DNO_CODE_ANALYSIS=1')
+     
+diff --git a/blutter/CMakeLists.txt b/blutter/CMakeLists.txt
+index 9751cd6..f658e16 100644
+--- a/blutter/CMakeLists.txt
++++ b/blutter/CMakeLists.txt
+@@ -107,6 +107,12 @@ endif()
+ if (UNIFORM_INTEGER_ACCESS)
+ 	set(defines ${defines} UNIFORM_INTEGER_ACCESS)
+ endif()
++if (NO_OBJECT_STORE_STUB_LIST)
++	set(defines ${defines} NO_OBJECT_STORE_STUB_LIST)
++endif()
++if (NO_AOT_CLOSURE_OFFSETS)
++	set(defines ${defines} NO_AOT_CLOSURE_OFFSETS)
++endif()
+ target_compile_definitions(${BINNAME} PRIVATE ${defines})
+ 
+ target_compile_options(${BINNAME} PRIVATE ${cc_opts})
+diff --git a/blutter/src/CodeAnalyzer_arm64.cpp b/blutter/src/CodeAnalyzer_arm64.cpp
+index c67a5b1..28513c0 100644
+--- a/blutter/src/CodeAnalyzer_arm64.cpp
++++ b/blutter/src/CodeAnalyzer_arm64.cpp
+@@ -8,6 +8,13 @@
+ 
+ #ifndef NO_CODE_ANALYSIS
+ 
++#ifdef NO_AOT_CLOSURE_OFFSETS
++// Dart >= 3.13 dropped UntaggedClosure::context_; use a never-matching disp so the
++// closure-prologue heuristics below simply do not fire.
++static constexpr intptr_t AOT_Closure_context_offset = 0x7fffff00;
++static constexpr intptr_t AOT_Closure_delayed_type_arguments_offset = 0x7fffff08;
++#endif
++
+ // auto revert ASM iterator to the current when pattern does not match or an exception occurs
+ class InsnMarker
+ {
+@@ -91,6 +98,11 @@ static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstR
+ 		case dart::kCodeCid: {
+ 			const auto& code = dart::Code::Cast(obj);
+ 			auto stub = app.GetFunction(code.EntryPoint() - app.base());
++			if (stub == nullptr) {
++				// Dart >= 3.13: stub table is gone, keep the value opaque instead of
++				// binding a reference to a null function
++				return new VarValue(dart::kFunctionCid, false);
++			}
+ 			ASSERT(stub);
+ 			return new VarFunctionCode(*stub);
+ 		}
+@@ -183,6 +195,11 @@ static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstR
+ 	}
+ }
+ 
++#if !defined(DART_COMPRESSED_POINTERS)
++// iOS builds never use compressed pointers, so the decompress patterns do not exist
++static inline void handleDecompressPointer(AsmIterator& insn, arm64_reg reg) { (void)insn; (void)reg; }
++static inline void handleExtraDecompressPointer(AsmIterator& insn, arm64_reg reg) { (void)insn; (void)reg; }
++#else
+ static inline void handleDecompressPointer(AsmIterator& insn, arm64_reg reg) {
+ 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
+ 	INSN_ASSERT(insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == reg);
+@@ -196,6 +213,7 @@ static inline void handleExtraDecompressPointer(AsmIterator& insn, arm64_reg reg
+ 	if (!(insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32)) return;
+ 	++insn;
+ }
++#endif // DART_COMPRESSED_POINTERS
+ 
+ // Handle leave-frame restore patterns for newer Dart ARM64 codegen.
+ // Accepted patterns:
+@@ -2494,6 +2512,10 @@ std::unique_ptr<MoveRegInstr> FunctionAnalyzer::processMoveRegInstr(AsmIterator&
+ 
+ std::unique_ptr<DecompressPointerInstr> FunctionAnalyzer::processDecompressPointerInstr(AsmIterator& insn)
+ {
++#if !defined(DART_COMPRESSED_POINTERS)
++	(void)insn;
++	return nullptr;
++#else
+ 	if (insn.id() == ARM64_INS_ADD && insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32) {
+ 		INSN_ASSERT(insn.ops(0).reg == insn.ops(1).reg);
+ 		const auto reg = A64::Register{ insn.ops(0).reg };
+@@ -2502,6 +2524,7 @@ std::unique_ptr<DecompressPointerInstr> FunctionAnalyzer::processDecompressPoint
+ 		return std::make_unique<DecompressPointerInstr>(insn.Wrap(ins0_addr), reg);
+ 	}
+ 	return nullptr;
++#endif
+ }
+ 
+ std::unique_ptr<SaveRegisterInstr> FunctionAnalyzer::processSaveRegisterInstr(AsmIterator& insn)
+@@ -3282,8 +3305,10 @@ std::unique_ptr<WriteBarrierInstr> FunctionAnalyzer::processWriteBarrierInstr(As
+ 
+ 	INSN_ASSERT(insn.id() == ARM64_INS_TST);
+ 	INSN_ASSERT(insn.ops(0).reg == CSREG_DART_TMP);
++#if defined(DART_COMPRESSED_POINTERS)
+ 	INSN_ASSERT(insn.ops(1).reg == CSREG_DART_HEAP);
+ 	INSN_ASSERT(insn.ops(1).shift.type == ARM64_SFT_LSR && insn.ops(1).shift.value == 32);
++#endif
+ 	++insn;
+ 
+ 	INSN_ASSERT(insn.id() == ARM64_INS_B && insn.cc() == ARM64_CC_EQ);
+@@ -3306,11 +3331,19 @@ std::unique_ptr<WriteBarrierInstr> FunctionAnalyzer::processWriteBarrierInstr(As
+ 	bool isArray;
+ 	if (insn.id() == ARM64_INS_BL) {
+ 		auto stub = app.GetFunction(insn.ops(0).imm);
++		setAsmTextDataCall(insn.address(), (uint64_t)insn.ops(0).imm);
++#ifdef NO_OBJECT_STORE_STUB_LIST
++		// Dart >= 3.13: no stub table, so the barrier kind cannot be resolved
++		isArray = false;
++		if (stub != nullptr && stub->IsStub()) {
++			isArray = reinterpret_cast<DartStub*>(stub)->kind == DartStub::ArrayWriteBarrierStub;
++		}
++#else
+ 		INSN_ASSERT(stub->IsStub());
+ 		const auto stubKind = reinterpret_cast<DartStub*>(stub)->kind;
+ 		INSN_ASSERT(stubKind == DartStub::WriteBarrierWrappersStub || stubKind == DartStub::ArrayWriteBarrierStub);
+ 		isArray = stubKind == DartStub::ArrayWriteBarrierStub;
+-		setAsmTextDataCall(insn.address(), (uint64_t)insn.ops(0).imm);
++#endif
+ 		++insn;
+ 	}
+ 	else {
+diff --git a/blutter/src/DartApp.cpp b/blutter/src/DartApp.cpp
+index 25ad347..74f80bf 100644
+--- a/blutter/src/DartApp.cpp
++++ b/blutter/src/DartApp.cpp
+@@ -294,6 +294,12 @@ void DartApp::loadFromClassTable(dart::IsolateGroup* ig)
+ 
+ void DartApp::loadStubs(dart::ObjectStore* store)
+ {
++#ifdef NO_OBJECT_STORE_STUB_LIST
++	// Dart >= 3.13: every stub (including _iso_stub_*) lives in StubCode, the
++	// ObjectStore no longer keeps CodePtr members for them.
++	(void)store;
++	throwStubAddr = 0;
++#else
+ 	dart::CodePtr ptr;
+ 	auto& code = dart::Code::Handle();
+ 	uint64_t ep_addr;
+@@ -340,6 +346,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
+ 	}
+ 	VM_STUB_CODE_LIST(DO);
+ #undef DO
++#endif // NO_OBJECT_STORE_STUB_LIST
+ }
+ 
+ DartFunction* DartApp::addFunctionNoCheck(const dart::Function& func)
+@@ -412,6 +419,10 @@ void DartApp::findFunctionInHeap()
+ 			ASSERT(code.IsStubCode());
+ 			if (!stubs.contains(ep_offset)) {
+ 				//std::cout << std::format("unknown stub at: {:#x}, {}, size: {}\n", ep_offset, code.ToCString(), code.Size());
++#ifdef NO_OBJECT_STORE_STUB_LIST
++				// Dart >= 3.13: no stub table available, unknown stub code is left as-is
++				if (stubs.empty()) continue;
++#endif
+ 				auto stub_size = code.Size();
+ 				DartStub* candidateStub = nullptr;
+ 				std::vector<DartStub*> candidateStubs;
+@@ -426,7 +437,11 @@ void DartApp::findFunctionInHeap()
+ 					}
+ 				}
+ 				if (candidateStub == nullptr) {
++#ifdef NO_OBJECT_STORE_STUB_LIST
++					if (candidateStubs.empty()) continue;
++#else
+ 					RELEASE_ASSERT(!candidateStubs.empty());
++#endif
+ 					if (candidateStubs.size() == 1) {
+ 						candidateStub = candidateStubs[0];
+ 					}
+diff --git a/blutter/src/DartDumper.cpp b/blutter/src/DartDumper.cpp
+index 85bde37..5c5bd12 100644
+--- a/blutter/src/DartDumper.cpp
++++ b/blutter/src/DartDumper.cpp
+@@ -367,14 +367,14 @@ void DartDumper::DumpCode(const char* out_dir)
+ 							of << "    ";
+ 						}
+ 						else {
+-							while ((*il_itr)->Start() < asmText.addr) {
++							while (*il_itr != nullptr && (*il_itr)->Start() < asmText.addr) {
+ 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
+ 									of << std::format("{:#x}: {}\n", (*il_itr)->Start(), (*il_itr)->ToString());
+ 									of << "    // ";
+ 								}
+ 								++il_itr;
+ 							}
+-							if ((*il_itr)->Start() == asmText.addr) {
++							if (*il_itr != nullptr && (*il_itr)->Start() == asmText.addr) {
+ 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
+ 									of << std::format("{:#x}: {}\n", asmText.addr, (*il_itr)->ToString());
+ 									of << "    //     ";
+diff --git a/blutter/src/DartLoader.cpp b/blutter/src/DartLoader.cpp
+index b938219..202f07b 100644
+--- a/blutter/src/DartLoader.cpp
++++ b/blutter/src/DartLoader.cpp
+@@ -2,6 +2,8 @@
+ #include "DartLoader.h"
+ #include <stdexcept>
+ #include <cstdlib>
++#include <type_traits>
++#include <utility>
+ 
+ // Note: most running dart VM code from runtime/bin/main.cc
+ 
+@@ -18,6 +20,29 @@ static void init_vm_flags()
+ 		throw std::runtime_error(error);
+ }
+ 
++// Dart >= 3.12 removed the snapshot fields from Dart_InitializeParams and moves
++// the snapshot into Dart_CreateIsolateGroup (fused snapshot style, used by iOS).
++template <typename T, typename = void>
++struct has_vm_snapshot_field : std::false_type {};
++
++template <typename T>
++struct has_vm_snapshot_field<T, std::void_t<decltype(std::declval<T&>().vm_snapshot_data)>>
++	: std::true_type {};
++
++template <typename Params>
++static void assign_vm_snapshot(Params& init_params, const uint8_t* data, const uint8_t* instr)
++{
++	if constexpr (has_vm_snapshot_field<Params>::value) {
++		init_params.vm_snapshot_data = data;
++		init_params.vm_snapshot_instructions = instr;
++	}
++	else {
++		// snapshot is handed over at isolate group creation instead (see load_isolate)
++		(void)data;
++		(void)instr;
++	}
++}
++
+ static void init_dart(const uint8_t* vm_snapshot_data, const uint8_t* vm_snapshot_instructions)
+ {
+ 	char* error = NULL;
+@@ -25,9 +50,8 @@ static void init_dart(const uint8_t* vm_snapshot_data, const uint8_t* vm_snapsho
+ 	Dart_InitializeParams init_params;
+ 	memset(&init_params, 0, sizeof(init_params));
+ 	init_params.version = DART_INITIALIZE_PARAMS_CURRENT_VERSION;
+-	init_params.vm_snapshot_data = vm_snapshot_data;
+-	init_params.vm_snapshot_instructions = vm_snapshot_instructions;
+ 	init_params.start_kernel_isolate = false;
++	assign_vm_snapshot(init_params, vm_snapshot_data, vm_snapshot_instructions);
+ 	// other params are no needed if snapshot is not run
+ 	error = Dart_Initialize(&init_params);
+ 	if (error) {
+diff --git a/blutter/src/DartStub.h b/blutter/src/DartStub.h
+index f932cbc..b233af9 100644
+--- a/blutter/src/DartStub.h
++++ b/blutter/src/DartStub.h
+@@ -10,14 +10,32 @@ class DartStub : public DartFnBase
+ {
+ public:
+ 	enum Kind : int32_t {
++#ifndef NO_OBJECT_STORE_STUB_LIST
+ #define DO(member, name) name ## Stub,
+ 		OBJECT_STORE_STUB_CODE_LIST(DO)
+ #undef DO
++#else
++		// Dart >= 3.13 removed the isolate stubs from ObjectStore
++#endif
+ 		BuildNonGenericMethodExtractorStub,
+ 		BuildGenericMethodExtractorStub,
+ #define DO(name) name ## VMStub,
+ 		VM_STUB_CODE_LIST(DO)
+ #undef DO
++#ifdef NO_OBJECT_STORE_STUB_LIST
++		// Dart >= 3.13 renamed every VM stub to <name>VMStub; keep old spellings alive
++		ArrayWriteBarrierStub = ArrayWriteBarrierVMStub,
++		WriteBarrierWrappersStub = WriteBarrierWrappersVMStub,
++		AllocateMintSharedWithFPURegsStub = AllocateMintSharedWithFPURegsVMStub,
++		AllocateMintSharedWithoutFPURegsStub = AllocateMintSharedWithoutFPURegsVMStub,
++		DefaultTypeTestStub = DefaultTypeTestVMStub,
++		DefaultNullableTypeTestStub = DefaultNullableTypeTestVMStub,
++		InitAsyncStub = InitAsyncVMStub,
++		InitLateStaticFieldStub = InitLateStaticFieldVMStub,
++		InitLateFinalStaticFieldStub = InitLateFinalStaticFieldVMStub,
++		LateInitializationErrorSharedWithFPURegsStub = LateInitializationErrorSharedWithFPURegsVMStub,
++		LateInitializationErrorSharedWithoutFPURegsStub = LateInitializationErrorSharedWithoutFPURegsVMStub,
++#endif
+ 		SharedStub,
+ 		AllocateUserObjectStub,
+ 		TypeCheckStub,
+diff --git a/blutter/src/DartTypes.cpp b/blutter/src/DartTypes.cpp
+index 9482811..e94555e 100644
+--- a/blutter/src/DartTypes.cpp
++++ b/blutter/src/DartTypes.cpp
+@@ -327,7 +327,8 @@ DartAbstractType* DartTypeDb::FindOrAdd(dart::AbstractTypePtr abTypePtr)
+ 		return FindOrAdd(dart::FunctionType::RawCast(abTypePtr));
+ 	}
+ 	//return nullptr;
+-	FATAL("Invalid abstract type");
++	fprintf(stderr, "warning: unhandled abstract type cid %d\n", (int)abTypePtr.GetClassId());
++	return nullptr;
+ }
+ 
+ const DartTypeArguments* DartTypeDb::FindOrAdd(dart::TypeArgumentsPtr typeArgsPtr)
+diff --git a/blutter/src/Disassembler_arm64.h b/blutter/src/Disassembler_arm64.h
+index 6b78a9d..91c29bd 100644
+--- a/blutter/src/Disassembler_arm64.h
++++ b/blutter/src/Disassembler_arm64.h
+@@ -82,8 +82,13 @@ constexpr arm64_reg CSREG_DART_WB_SLOT = ToCapstoneReg(dart::kWriteBarrierSlotRe
+ constexpr arm64_reg CSREG_DART_THR = ToCapstoneReg(dart::THR);
+ constexpr arm64_reg CSREG_DART_PP = ToCapstoneReg(dart::PP);
+ #if defined(DART_COMPRESSED_POINTERS)
++#ifdef NO_HEAP_BITS
++// Dart >= 3.13 renamed HEAP_BITS; PP (x28) is the Dart heap/object-pool register
++constexpr arm64_reg CSREG_DART_HEAP = ToCapstoneReg(dart::PP);
++#else
+ constexpr arm64_reg CSREG_DART_HEAP = ToCapstoneReg(dart::HEAP_BITS);
+ #endif
++#endif
+ constexpr arm64_reg CSREG_DART_TMP = ToCapstoneReg(dart::TMP);
+ constexpr arm64_reg CSREG_DART_TMP2 = ToCapstoneReg(dart::TMP2);
+ // Note: kTagReg is normally in wrapper function. can ignore it.
+diff --git a/blutter/src/ElfHelper.cpp b/blutter/src/ElfHelper.cpp
+index 030c0a2..6cb39d1 100644
+--- a/blutter/src/ElfHelper.cpp
++++ b/blutter/src/ElfHelper.cpp
+@@ -8,6 +8,7 @@ PRAGMA_WARNING(push, 0)
+ #endif
+ PRAGMA_WARNING(pop)
+ #include <algorithm>
++#include <vector>
+ #include <stdexcept>
+ #if defined(_WIN32) || defined(WIN32)
+ #define WIN32_LEAN_AND_MEAN
+@@ -31,6 +32,13 @@ struct ElfIdent {
+ 
+ using namespace dart::elf;
+ 
++// Dart >= 3.13 dropped these from platform/elf.h; values are the real ELF symbol names
++static constexpr const char* kVmSnapshotDataAsmSymbol = "_kDartVmSnapshotData";
++static constexpr const char* kVmSnapshotInstructionsAsmSymbol = "_kDartVmSnapshotInstructions";
++static constexpr const char* kIsolateSnapshotDataAsmSymbol = "_kDartIsolateSnapshotData";
++static constexpr const char* kIsolateSnapshotInstructionsAsmSymbol = "_kDartIsolateSnapshotInstructions";
++
++
+ #ifdef _WIN32
+ static void* load_map_file(const char* path)
+ {
+@@ -68,6 +76,142 @@ static void* load_map_file(const char* path)
+ }
+ #endif
+ 
++
++// ---------------------------------------------------------------------------
++// Minimal Mach-O (iOS App.framework) support added for pure-static iOS apps.
++// iOS builds ship a *fused* AOT snapshot: only _kDartSnapshotData (data) and
++// _kDartSnapshotText (code) exist, unlike Android's 4 separate symbols.
++// ---------------------------------------------------------------------------
++namespace macho {
++
++struct mach_header_64 {
++	uint32_t magic;
++	uint32_t cputype;
++	uint32_t cpusubtype;
++	uint32_t filetype;
++	uint32_t ncmds;
++	uint32_t sizeofcmds;
++	uint32_t flags;
++	uint32_t reserved;
++};
++
++struct load_command {
++	uint32_t cmd;
++	uint32_t cmdsize;
++};
++
++struct segment_command_64 {
++	uint32_t cmd;
++	uint32_t cmdsize;
++	char segname[16];
++	uint64_t vmaddr;
++	uint64_t vmsize;
++	uint64_t fileoff;
++	uint64_t filesize;
++	uint32_t maxprot;
++	uint32_t initprot;
++	uint32_t nsects;
++	uint32_t flags;
++};
++
++struct symtab_command {
++	uint32_t cmd;
++	uint32_t cmdsize;
++	uint32_t symoff;
++	uint32_t nsyms;
++	uint32_t stroff;
++	uint32_t strsize;
++};
++
++struct nlist_64 {
++	uint32_t n_strx;
++	uint8_t n_type;
++	uint8_t n_sect;
++	uint16_t n_desc;
++	uint64_t n_value;
++};
++
++static constexpr uint32_t MH_MAGIC_64 = 0xfeedfacfu;
++static constexpr uint32_t LC_SEGMENT_64 = 0x19u;
++static constexpr uint32_t LC_SYMTAB = 0x2u;
++
++struct VmToFile {
++	const segment_command_64* seg;
++	uintptr_t off(const uint64_t addr) const {
++		return (uintptr_t)(addr - seg->vmaddr + seg->fileoff);
++	}
++	bool contains(uint64_t addr) const { return addr >= seg->vmaddr && addr < seg->vmaddr + seg->vmsize; }
++};
++
++static const uint8_t* resolve(const uint8_t* base, const std::vector<VmToFile>& segs, uint64_t addr)
++{
++	for (const auto& s : segs) {
++		if (s.contains(addr)) {
++			return base + s.off(addr);
++		}
++	}
++	return nullptr;
++}
++
++} // namespace macho
++
++static LibAppInfo findSnapshotsMachO(const uint8_t* base)
++{
++	using namespace macho;
++	const auto* hdr = (const mach_header_64*)base;
++	if (hdr->magic != MH_MAGIC_64)
++		throw std::invalid_argument("Mach-O: invalid or non 64-bit magic");
++	if (hdr->cputype != 0x0100000c) // CPU_TYPE_ARM64
++		throw std::invalid_argument("Mach-O: expected arm64 (only arm64 AOT is supported)");
++
++	std::vector<VmToFile> segs;
++	const symtab_command* symtab = nullptr;
++
++	const uint8_t* p = base + sizeof(mach_header_64);
++	for (uint32_t i = 0; i < hdr->ncmds; i++) {
++		const auto* lc = (const load_command*)p;
++		if (lc->cmdsize == 0)
++			break;
++		if (lc->cmd == LC_SEGMENT_64) {
++			segs.push_back({ (const segment_command_64*)lc });
++		}
++		else if (lc->cmd == LC_SYMTAB) {
++			symtab = (const symtab_command*)lc;
++		}
++		p += lc->cmdsize;
++	}
++
++	if (symtab == nullptr)
++		throw std::invalid_argument("Mach-O: no LC_SYMTAB (binary is stripped?)");
++
++	const char* strtab = (const char*)base + symtab->stroff;
++	const auto* syms = (const nlist_64*)(base + symtab->symoff);
++
++	const uint8_t* snap_data = nullptr;
++	const uint8_t* snap_text = nullptr;
++	for (uint32_t i = 0; i < symtab->nsyms; i++) {
++		const char* name = strtab + syms[i].n_strx;
++		if (strcmp(name, "_kDartSnapshotData") == 0)
++			snap_data = resolve(base, segs, syms[i].n_value);
++		else if (strcmp(name, "_kDartSnapshotText") == 0)
++			snap_text = resolve(base, segs, syms[i].n_value);
++	}
++
++	if (snap_data == nullptr)
++		throw std::invalid_argument("Mach-O: cannot find _kDartSnapshotData");
++	if (snap_text == nullptr)
++		throw std::invalid_argument("Mach-O: cannot find _kDartSnapshotText");
++
++	// fused snapshot: every slot points at the same buffer pair
++	return LibAppInfo{
++		.lib = base,
++		.vm_snapshot_data = snap_data,
++		.vm_snapshot_instructions = snap_text,
++		.isolate_snapshot_data = snap_data,
++		.isolate_snapshot_instructions = snap_text,
++	};
++}
++
+ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ {
+ 	const auto* hdr = (const ElfHeader*)elf;
+@@ -150,42 +294,26 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ LibAppInfo ElfHelper::MapLibAppSo(const char* path)
+ {
+ 	void* lib = load_map_file(path);
+-	// quick and dirty parsing ELF to get symbol addresses
+-	uint8_t* elf = (uint8_t*)(lib);
+-#if defined(DART_TARGET_OS_MACOS)
+-	// Note: only new dart version getting snapshots from load command
+-	// <=2.17, use EXPORT name
+-	// <= v2.18,  load from sub SEGMENT_64, named "__CUSTOM" and section named "__dart_app_snap"
+-	// >= 2.19, LC_NOTE command is used
+-	auto header = (dart::mach_o::mach_header_64*)lib;
+-	switch (header->magic) {
+-	case dart::mach_o::MH_MAGIC:
+-	case dart::mach_o::MH_CIGAM:
+-		throw std::invalid_argument("Mach-O: Support only 64 bits");
+-	case dart::mach_o::MH_CIGAM_64:
+-		throw std::invalid_argument("Mach-O: Expected a host endian header");
+-	case dart::mach_o::MH_MAGIC_64:
+-		return size >= sizeof(mach_o::mach_header_64);
+-	default:
+-		throw std::invalid_argument("Mach-O: Invalid magic header");
++	uint8_t* img = (uint8_t*)(lib);
++	if (img == nullptr)
++		throw std::invalid_argument("Cannot map input file");
++
++	// sniff container format instead of trusting the host OS
++	const uint32_t magic = *(const uint32_t*)img;
++	if (magic == macho::MH_MAGIC_64 || magic == 0xcffaedfe /* MH_CIGAM_64 */) {
++		if (magic == 0xcffaedfe)
++			throw std::invalid_argument("Mach-O: byte-swapped image is not supported");
++		return findSnapshotsMachO(img);
+ 	}
+-#else
+-	const auto* hdr = (ElfHeader*)elf;
++
++	const auto* hdr = (ElfHeader*)img;
+ 	const auto* ident = (ElfIdent*)hdr->ident;
+ 	if (memcmp(ident->ei_magic, "\x7f" "ELF", 4) != 0)
+-		throw std::invalid_argument("ELF: Invalid magic header"); // need ELF file
++		throw std::invalid_argument("Unknown container format (neither ELF nor Mach-O)");
+ 	if (ident->ei_data != 1)
+-		throw std::invalid_argument("ELF: Support only little endian"); // expect little-endian
+-
+-	if (ident->ei_class != ELFCLASS64) { // 1 is 32 bits, 2 is 64 bits
+-		throw std::invalid_argument("ELF: Support only 64 bits"); // support only 64 bits
+-	}
+-	// expected e_machine
+-	//   3: x86, 0x28: ARM
+-	//   0x3e: x86-64, 0xB7: Aarch64
+-	// EM_386, EM_ARM, EM_X86_64, EM_AARCH64
+-	//hdr->e_machine;
+-#endif
++		throw std::invalid_argument("ELF: Support only little endian");
++	if (ident->ei_class != ELFCLASS64)
++		throw std::invalid_argument("ELF: Support only 64 bits");
+ 
+-	return findSnapshots(elf);
++	return findSnapshots(img);
+ }
+diff --git a/blutter/src/FridaWriter.cpp b/blutter/src/FridaWriter.cpp
+index 405f9c6..7f5006b 100644
+--- a/blutter/src/FridaWriter.cpp
++++ b/blutter/src/FridaWriter.cpp
+@@ -115,7 +115,11 @@ void FridaWriter::Create(const char* filename)
+ 				of << "{id:" << dartCls->Id() << ",";
+ 				of << "name:\"Closure\",";
+ 				of << "fnOffset:" << AOT_Closure_function_offset << ",";
++#ifdef NO_AOT_CLOSURE_OFFSETS
++				of << "contextOffset:" << 0 << ",";
++#else
+ 				of << "contextOffset:" << AOT_Closure_context_offset << ",";
++#endif
+ 				of << "epOffset:" << AOT_Closure_entry_point_offset << "},\n";
+ 				break;
+ 			case dart::kTypedDataUint8ArrayCid:
+diff --git a/blutter/src/VarValue.cpp b/blutter/src/VarValue.cpp
+index 9f33322..a5771ee 100644
+--- a/blutter/src/VarValue.cpp
++++ b/blutter/src/VarValue.cpp
+@@ -107,7 +107,7 @@ std::string VarItem::Name()
+ 	switch (storage.kind) {
+ 	case VarStorage::Immediate:
+ 	case VarStorage::Pool:
+-		return val->ToString();
++		return val ? val->ToString() : std::string("BUG_NO_ASSIGN_VALUE");
+ 	default:
+ 		return storage.Name();
+ 	}
+@@ -119,7 +119,7 @@ std::string VarItem::CallArgName()
+ 	case VarStorage::Immediate:
+ 	case VarStorage::Pool:
+ 	case VarStorage::Register:
+-		return val->ToString();
++		return val ? val->ToString() : std::string("BUG_NO_ASSIGN_VALUE");
+ 	default:
+ 		return storage.Name();
+ 	}
+diff --git a/dartvm_fetch_build.py b/dartvm_fetch_build.py
+index cc9967c..2d6ad7a 100644
+--- a/dartvm_fetch_build.py
++++ b/dartvm_fetch_build.py
+@@ -52,6 +52,9 @@ def checkout_dart(info: DartLibInfo):
+ 
+     # if no version file,assume previous clone is failed. delete the whole directory and try again.
+     version_file = os.path.join(clonedir, 'runtime', 'vm', 'version.cc')
++    if not os.path.exists(version_file):
++        # newer Dart SDK ships version_in.cc (version.cc is generated at build time)
++        version_file = os.path.join(clonedir, 'runtime', 'vm', 'version_in.cc')
+     if os.path.exists(clonedir) and not os.path.exists(version_file):
+         print('Delete incomplete clone directory ' + clonedir)
+         def remove_readonly(func, path, _):
+diff --git a/extract_dart_info.py b/extract_dart_info.py
+index 60e4cf2..85e0b8f 100644
+--- a/extract_dart_info.py
++++ b/extract_dart_info.py
+@@ -12,7 +12,103 @@ from elftools.elf.enums import ENUM_E_MACHINE
+ from elftools.elf.sections import SymbolTableSection
+ 
+ # TODO: support both ELF and Mach-O file
++
++# ---------------------------------------------------------------------------
++# minimal Mach-O (iOS App.framework) support
++# ---------------------------------------------------------------------------
++MH_MAGIC_64 = 0xfeedfacf
++LC_SEGMENT_64 = 0x19
++LC_SYMTAB = 0x2
++CPU_TYPE_ARM64 = 0x0100000C
++CPU_TYPE_X86_64 = 0x01000007
++
++
++class MachOImage:
++    """tiny Mach-O<64,little-endian> reader: load commands + symbol table"""
++
++    def __init__(self, path):
++        with open(path, 'rb') as f:
++            self.buf = f.read()
++        b = self.buf
++        magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, _ = unpack('<8I', b[:32])
++        if magic != MH_MAGIC_64:
++            raise ValueError(f'not a Mach-O 64 image: magic={magic:#x}')
++        self.cputype = cputype
++        self.segments = []      # (vmaddr, vmsize, fileoff, filesize)
++        self.symtab = None
++        off = 32
++        for _ in range(ncmds):
++            cmd, cmdsize = unpack('<II', b[off:off + 8])
++            if cmdsize == 0:
++                break
++            if cmd == LC_SEGMENT_64:
++                segname = b[off + 8:off + 24].rstrip(b'\x00').decode()
++                vmaddr, vmsize, fileoff, filesize = unpack('<4Q', b[off + 24:off + 56])
++                self.segments.append((segname, vmaddr, vmsize, fileoff, filesize))
++            elif cmd == LC_SYMTAB:
++                symoff, nsyms, stroff, strsize = unpack('<4I', b[off + 8:off + 24])
++                self.symtab = (symoff, nsyms, stroff, strsize)
++            off += cmdsize
++
++    def vm_to_offset(self, addr):
++        for segname, vmaddr, vmsize, fileoff, filesize in self.segments:
++            if vmaddr <= addr < vmaddr + vmsize:
++                return fileoff + (addr - vmaddr)
++        raise ValueError(f'address {addr:#x} is not backed by any segment')
++
++    def symbols(self):
++        if self.symtab is None:
++            return {}
++        symoff, nsyms, stroff, strsize = self.symtab
++        strtab = self.buf[stroff:stroff + strsize]
++        out = {}
++        for i in range(nsyms):
++            base = symoff + i * 16
++            n_strx, n_type, n_sect, n_desc, n_value = unpack('<IBBHQ', self.buf[base:base + 16])
++            name = strtab[n_strx:strtab.index(b'\x00', n_strx)].decode(errors='replace')
++            out[name] = n_value
++        return out
++
++    @property
++    def arch(self):
++        return {CPU_TYPE_ARM64: 'arm64', CPU_TYPE_X86_64: 'x64'}.get(self.cputype, 'unknown')
++
++
++def find_dart_snapshot_offsets(libapp_file):
++    """returns (snapshot_data_offset, snapshot_instructions_offset)"""
++    img = MachOImage(libapp_file)
++    syms = img.symbols()
++    data_addr = syms.get('_kDartSnapshotData')
++    text_addr = syms.get('_kDartSnapshotText')
++    if data_addr is None or text_addr is None:
++        # pre-2.19 style: exported snapshot symbols
++        for alt in ('_kDartVmSnapshotData', '_kDartIsolateSnapshotData'):
++            if alt in syms:
++                data_addr = syms[alt]
++                break
++        for alt in ('_kDartVmSnapshotText', '_kDartIsolateSnapshotText'):
++            if alt in syms:
++                text_addr = syms[alt]
++                break
++    if data_addr is None or text_addr is None:
++        raise ValueError('cannot locate Dart snapshot symbols in Mach-O')
++    return img.vm_to_offset(data_addr), img.vm_to_offset(text_addr)
++
++
++def extract_snapshot_hash_flags_macho(libapp_file):
++    data_off, _ = find_dart_snapshot_offsets(libapp_file)
++    with open(libapp_file, 'rb') as f:
++        f.seek(data_off + 20)          # header: magic(4) length(4) kind(4) pad(8)
++        snapshot_hash = f.read(32).decode()
++        data = f.read(512)
++    flags = data[:data.index(b'\x00')].decode().strip().split(' ')
++    return snapshot_hash, flags
++
+ def extract_snapshot_hash_flags(libapp_file):
++    with open(libapp_file, 'rb') as f:
++        magic = unpack('<I', f.read(4))[0]
++    if magic == MH_MAGIC_64:
++        return extract_snapshot_hash_flags_macho(libapp_file)
+     with open(libapp_file, 'rb') as f:
+         elf = ELFFile(f)
+         # find "_kDartVmSnapshotData" symbol
+@@ -28,6 +124,15 @@ def extract_snapshot_hash_flags(libapp_file):
+     return snapshot_hash, flags
+ 
+ def extract_libflutter_info(libflutter_file):
++    with open(libflutter_file, 'rb') as f:
++        magic = unpack('<I', f.read(4))[0]
++    if magic == MH_MAGIC_64:
++        img = MachOImage(libflutter_file)
++        data = img.buf
++        engine_ids = [h.decode() for h in re.findall(b'\x00([a-f\\d]{40})(?=\x00)', data)]
++        m = re.search(br'\x00([\d\w\.-]+) \((stable|beta|dev)\)', data)
++        dart_version = None if m is None else m.group(1).decode()
++        return engine_ids, dart_version, img.arch, 'ios'
+     with open(libflutter_file, 'rb') as f:
+         elf = ELFFile(f)
+         if elf.header.e_machine == 'EM_AARCH64': # 183
+diff --git a/scripts/CMakeLists.txt b/scripts/CMakeLists.txt
+index e755ad8..2866a7e 100644
+--- a/scripts/CMakeLists.txt
++++ b/scripts/CMakeLists.txt
+@@ -60,7 +60,8 @@ if (${TARGET_OS} STREQUAL "android")
+ 	# Note: DART_COMPRESSED_POINTERS should be from the binary
+ 	#set(dart_pointers "DART_COMPRESSED_POINTERS")
+ else()
+-	set(target_os "DART_TARGET_OS_MACOS_IOS")
++	# iOS binaries also need DART_TARGET_OS_MACOS (see platform/globals.h target OS block)
++	set(target_os "DART_TARGET_OS_MACOS;DART_TARGET_OS_MACOS_IOS")
+ endif()
+ # TARGET_ARCH_ARM64 or TARGET_ARCH_X64
+ if (${TARGET_ARCH} STREQUAL "arm64")
